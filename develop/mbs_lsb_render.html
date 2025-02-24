@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>MSB+LSB Depth to Point Cloud (Static & Z-Flip)</title>
+  <style>
+    body { margin: 0; }
+    canvas { display: block; }
+    #controls {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      background: rgba(255,255,255,0.9);
+      padding: 10px;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <!-- Two file inputs: one for the MSB image and one for the LSB image -->
+  <div id="controls">
+    <label>MSB Image: <input type="file" id="msbInput" accept="image/png"></label><br>
+    <label>LSB Image: <input type="file" id="lsbInput" accept="image/png"></label><br>
+    <label>Original Width: <input type="number" id="widthInput" value="640"></label><br>
+    <label>Original Height: <input type="number" id="heightInput" value="576"></label><br>
+    <button id="processButton">Process & Render</button>
+  </div>
+  
+  <!-- Three.js Library -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  
+  <script>
+    // Camera intrinsics (for the original image; adjust as needed)
+    const fx = 504.135, fy = 504.129;
+    const cx = 324.466, cy = 327.652;
+    const depthScale = 1/1000; // Convert mm to meters
+
+    // Set up Three.js scene, camera, and renderer
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(
+      75, window.innerWidth / window.innerHeight, 0.1, 1000
+    );
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+    
+    // Adjust camera position for a better view
+    camera.position.z = 3;
+    
+    let pointCloud;  // Global reference to the current point cloud
+
+    // // Render loop (static view; remove auto-rotation if not needed)
+    // function animate() {
+    //   requestAnimationFrame(animate);
+    //   // Uncomment the line below to auto-rotate:
+    //    if (pointCloud) pointCloud.rotation.y += 0.001;
+    //   renderer.render(scene, camera);
+    // }
+    // animate();
+
+    let rotationDirection = 1;  // 1 for rotating right, -1 for left
+let rotationAngle = 0;  // Current rotation angle in radians
+
+function animate() {
+    requestAnimationFrame(animate);
+    
+    if (pointCloud) {
+        const rotationSpeed = 0.001; // Adjust rotation speed
+        
+        // Rotate within limits (-90 degrees to +90 degrees)
+        rotationAngle += rotationSpeed * rotationDirection;
+
+        if (rotationAngle >= Math.PI / 2) {  // +90 degrees (right)
+            rotationAngle = Math.PI / 2;
+            rotationDirection = -1; // Switch to rotating left
+        } else if (rotationAngle <= -Math.PI / 2) {  // -90 degrees (left)
+            rotationAngle = -Math.PI / 2;
+            rotationDirection = 1; // Switch to rotating right
+        }
+
+        pointCloud.rotation.y = rotationAngle; // Apply rotation
+    }
+    
+    renderer.render(scene, camera);
+}
+animate();
+
+
+    // Helper: load an image file into an HTMLImageElement
+    function loadImage(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = e => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = reject;
+          img.src = e.target.result;
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+
+    // Process the two images when button is clicked
+    document.getElementById("processButton").addEventListener("click", async () => {
+      const msbFile = document.getElementById("msbInput").files[0];
+      const lsbFile = document.getElementById("lsbInput").files[0];
+      if (!msbFile || !lsbFile) {
+        alert("Please select both MSB and LSB images.");
+        return;
+      }
+
+      // Remove any previous point cloud from the scene
+      if (pointCloud) {
+        scene.remove(pointCloud);
+        pointCloud = null;
+      }
+
+      // Original image dimensions from inputs
+      const origWidth = parseInt(document.getElementById("widthInput").value, 10);
+      const origHeight = parseInt(document.getElementById("heightInput").value, 10);
+      // Use the original dimensions directly
+      const width = origWidth;
+      const height = origHeight;
+
+      try {
+        // Load both images
+        const [msbImg, lsbImg] = await Promise.all([loadImage(msbFile), loadImage(lsbFile)]);
+
+        // Create off-screen canvas for MSB image with vertical flip.
+        const canvasMSB = document.createElement("canvas");
+        canvasMSB.width = width;
+        canvasMSB.height = height;
+        const ctxMSB = canvasMSB.getContext("2d");
+        ctxMSB.save();
+        // Flip vertically: translate to bottom then scale Y by -1.
+        ctxMSB.translate(0, height);
+        ctxMSB.scale(1, -1);
+        ctxMSB.drawImage(msbImg, 0, 0, origWidth, origHeight);
+        ctxMSB.restore();
+        const msbData = ctxMSB.getImageData(0, 0, width, height).data;
+
+        // Create off-screen canvas for LSB image with vertical flip.
+        const canvasLSB = document.createElement("canvas");
+        canvasLSB.width = width;
+        canvasLSB.height = height;
+        const ctxLSB = canvasLSB.getContext("2d");
+        ctxLSB.save();
+        ctxLSB.translate(0, height);
+        ctxLSB.scale(1, -1);
+        ctxLSB.drawImage(lsbImg, 0, 0, origWidth, origHeight);
+        ctxLSB.restore();
+        const lsbData = ctxLSB.getImageData(0, 0, width, height).data;
+
+        // Process pixel data: use the red channel for grayscale value.
+        const points = [];
+        for (let v = 0; v < height; v++) {
+          for (let u = 0; u < width; u++) {
+            const idx = (v * width + u) * 4;
+            const msb = msbData[idx]; // red channel
+            const lsb = lsbData[idx]; // red channel
+            // Reassemble the 16-bit depth value: msb * 256 + lsb (in mm)
+            const depthValue = msb * 256 + lsb;
+            const z = depthValue * depthScale;
+            if (z > 0) {
+              const x = ((u - cx) * z) / fx;
+              const y = ((v - cy) * z) / fy;
+              points.push(x, y, z);
+            }
+          }
+        }
+
+        // Convert points to a Float32Array and create BufferGeometry.
+        const pointsArray = new Float32Array(points);
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute("position", new THREE.BufferAttribute(pointsArray, 3));
+
+        // Create a PointsMaterial and the point cloud.
+        const material = new THREE.PointsMaterial({
+          color: 0x888888,
+          size: 0.0001 // Increase for better visibility
+        });
+        pointCloud = new THREE.Points(geometry, material);
+        // Flip the point cloud across the Z axis.
+        pointCloud.scale.z = -1;
+        scene.add(pointCloud);
+
+      } catch (err) {
+        console.error("Error loading images:", err);
+      }
+    });
+
+    // Adjust renderer on window resize
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

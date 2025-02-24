@@ -1,0 +1,214 @@
+<script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.152.2/examples/jsm/"
+      }
+    }
+  </script>
+  
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>vlmns-web-renderer</title>
+    <style>
+      body { margin: 0; font-family: sans-serif; }
+      #pointCloudContainer { width: 100vw; height: 100vh; overflow: hidden; }
+      #controls { position: absolute; top: 10px; left: 10px; z-index: 10; background: rgba(255,255,255,0.9); padding: 10px; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <div id="pointCloudContainer"></div>
+    <video id="videoElement" playsinline muted style="display:none;"></video>
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+  
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+  
+      // --- CONFIGURATION ---
+      const LIVEKIT_URL = "wss://vlmns-7prfjvwk.livekit.cloud";
+    const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NDA2NTc5ODEsImlzcyI6IkFQSWpkMkdwb1pjeEt4TSIsIm5iZiI6MTc0MDQwNzk4MSwic3ViIjoiYnJvd3NlciIsInZpZGVvIjp7ImNhblB1Ymxpc2giOnRydWUsImNhblB1Ymxpc2hEYXRhIjp0cnVlLCJjYW5TdWJzY3JpYmUiOnRydWUsInJvb20iOiJteS1yb29tIiwicm9vbUpvaW4iOnRydWV9fQ.yzX_3ULQjHyMpCbNu5PKOVE_TE5kBdIL23Wj1A0dqr0";
+    
+      const FRAME_WIDTH = 1280, FRAME_HEIGHT = 1296;
+      const LOBITS_Y_START = 720, LOBITS_Y_END = 1008;
+      const HIBITS_Y_START = 1008, HIBITS_Y_END = 1296;
+      const UNPACKED_WIDTH = 640, UNPACKED_HEIGHT = 576;
+      const fx = 503.359406, fy = 503.437744;
+      const cx = 321.307129, cy = 344.940552;
+      const depthScale = 1/1000;
+      let frameIndex = 0;
+  
+      // --- THREE.JS SETUP (incorporating WASD movement) ---
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.1, 1000);
+      // Set initial position close to the point cloud
+      camera.position.set(0, 0, 1);
+  
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.getElementById("pointCloudContainer").appendChild(renderer.domElement);
+  
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+  
+      // Global WASD movement variables
+      const moveSpeed = 0.005;
+      const keys = {};
+      window.addEventListener("keydown", (event) => { keys[event.code] = true; });
+      window.addEventListener("keyup", (event) => { keys[event.code] = false; });
+      const clock = new THREE.Clock();
+  
+      // Create an empty point cloud with positions (we assume all points will always be rendered)
+      const numPoints = UNPACKED_WIDTH * UNPACKED_HEIGHT;
+      const positions = new Float32Array(numPoints * 3);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      const material = new THREE.PointsMaterial({ color: 0x888888, size: 0.0001 });
+      const pointCloud = new THREE.Points(geometry, material);
+      // Flip the point cloud along Z (as in both codes)
+      pointCloud.scale.z = -1;
+      scene.add(pointCloud);
+  
+      // --- VIDEO AND OFFSCREEN CANVAS SETUP ---
+      const videoElement = document.getElementById("videoElement");
+      const offscreenCanvas = document.createElement("canvas");
+      offscreenCanvas.width = FRAME_WIDTH;
+      offscreenCanvas.height = FRAME_HEIGHT;
+      const offscreenCtx = offscreenCanvas.getContext("2d", { willReadFrequently: true });
+  
+      // Helper: Unpack the two halves of the packed depth image
+      function unpackPackedDepth(packedData, packedWidth, packedHeight) {
+        const origWidth = Math.floor(packedWidth / 2);
+        const origHeight = packedHeight * 2;
+        const output = new Uint8ClampedArray(origWidth * origHeight);
+        // Top half: copy first origWidth columns.
+        for (let row = 0; row < packedHeight; row++) {
+          for (let col = 0; col < origWidth; col++) {
+            output[row * origWidth + col] = packedData[row * packedWidth + col];
+          }
+        }
+        // Bottom half: copy next origWidth columns.
+        for (let row = 0; row < packedHeight; row++) {
+          for (let col = 0; col < origWidth; col++) {
+            output[(row + packedHeight) * origWidth + col] = packedData[row * packedWidth + col + origWidth];
+          }
+        }
+        return { data: output, width: origWidth, height: origHeight };
+      }
+  
+      // --- FRAME PROCESSING ---
+      function processFrame() {
+        // Draw the incoming video frame onto the offscreen canvas
+        offscreenCtx.drawImage(videoElement, 0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+  
+        // Extract the two packed regions (LSB and MSB)
+        const lobitsImgData = offscreenCtx.getImageData(0, LOBITS_Y_START, FRAME_WIDTH, LOBITS_Y_END - LOBITS_Y_START);
+        const hibitsImgData = offscreenCtx.getImageData(0, HIBITS_Y_START, FRAME_WIDTH, HIBITS_Y_END - HIBITS_Y_START);
+  
+        // Helper to extract red channel only.
+        function extractPackedData(imgData) {
+          const len = imgData.width * imgData.height;
+          const arr = new Uint8ClampedArray(len);
+          for (let i = 0; i < len; i++) {
+            arr[i] = imgData.data[i * 4];
+          }
+          return arr;
+        }
+        const lobitsPacked = extractPackedData(lobitsImgData);
+        const hibitsPacked = extractPackedData(hibitsImgData);
+  
+        // Unpack to obtain LSB and MSB images (each 640x576)
+        const lobitsUnpacked = unpackPackedDepth(lobitsPacked, lobitsImgData.width, lobitsImgData.height);
+        const hibitsUnpacked = unpackPackedDepth(hibitsPacked, hibitsImgData.width, hibitsImgData.height);
+  
+        // Update the point cloud positions using the same logic as Code 2:
+        // For each pixel, reassemble the 16-bit depth value and compute its 3D coordinates.
+        for (let i = 0; i < numPoints; i++) {
+          const msb = hibitsUnpacked.data[i];
+          const lsb = lobitsUnpacked.data[i];
+          const depth16 = (msb << 8) | lsb; // equivalent to msb*256 + lsb
+          const z = depth16 * depthScale;
+          // Calculate (u,v) pixel coordinates
+          const u = i % UNPACKED_WIDTH;
+          const v = Math.floor(i / UNPACKED_WIDTH);
+          const x = ((u - cx) * z) / fx;
+          const y = ((v - cy) * z) / fy;
+          positions[i * 3]     = x;
+          positions[i * 3 + 1] = y;
+          positions[i * 3 + 2] = z;
+        }
+        geometry.attributes.position.needsUpdate = true;
+        frameIndex++;
+        // Request the next frame (using the VideoFrame callback API)
+        videoElement.requestVideoFrameCallback(processFrame);
+      }
+  
+      // --- ANIMATE LOOP (with WASD movement) ---
+      function animate() {
+        requestAnimationFrame(animate);
+        const delta = clock.getDelta();
+        const direction = new THREE.Vector3();
+  
+        // WASD movement handling:
+        if (keys["KeyW"]) {
+          camera.getWorldDirection(direction);
+          camera.position.addScaledVector(direction, moveSpeed * delta * 1000);
+        }
+        if (keys["KeyS"]) {
+          camera.getWorldDirection(direction);
+          camera.position.addScaledVector(direction, -moveSpeed * delta * 1000);
+        }
+        if (keys["KeyA"]) {
+          camera.getWorldDirection(direction);
+          // left vector: cross product of camera.up and forward
+          const left = new THREE.Vector3().crossVectors(camera.up, direction).normalize();
+          camera.position.addScaledVector(left, moveSpeed * delta * 1000);
+        }
+        if (keys["KeyD"]) {
+          camera.getWorldDirection(direction);
+          // right vector: cross product of forward and camera.up
+          const right = new THREE.Vector3().crossVectors(direction, camera.up).normalize();
+          camera.position.addScaledVector(right, moveSpeed * delta * 1000);
+        }
+  
+        controls.update();
+        renderer.render(scene, camera);
+        renderer.domElement.style.transform = 'scaleY(-1) scaleZ(-1)';
+
+      }
+      animate();
+  
+      // --- LiveKit Connection ---
+      async function connectLiveKit() {
+        const room = new LivekitClient.Room({ autoSubscribe: true });
+        await room.connect(LIVEKIT_URL, TOKEN);
+        console.log("Connected to room:", room.name);
+  
+        room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication) => {
+          if (track.kind === LivekitClient.Track.Kind.Video) {
+            console.log("Video track subscribed:", publication.sid);
+            const attachedEl = track.attach();
+            attachedEl.style.display = "none";
+            videoElement.srcObject = attachedEl.srcObject;
+            videoElement.play();
+            videoElement.addEventListener("loadeddata", () => {
+              videoElement.requestVideoFrameCallback(processFrame);
+            });
+          }
+        });
+      }
+      connectLiveKit().catch(err => console.error("LiveKit connection error:", err));
+  
+      // --- Window Resize Handling ---
+      window.addEventListener("resize", () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+    </script>
+  </body>
+  </html>
+  

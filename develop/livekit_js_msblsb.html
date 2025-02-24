@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>LiveKit Megaframe Splitter & Depth Viewer</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    .container {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin: 10px;
+    }
+    .box {
+      border: 1px solid #aaa;
+      padding: 5px;
+    }
+    canvas { background: #000; }
+  </style>
+</head>
+<body>
+  <h1>LiveKit Megaframe Splitter & Depth Viewer</h1>
+  <div class="container">
+    <div class="box">
+      <h3>LSB (Lobits Unpacked)</h3>
+      <canvas id="lsbCanvas" width="640" height="576"></canvas>
+    </div>
+    <div class="box">
+      <h3>MSB (Hibits Unpacked)</h3>
+      <canvas id="msbCanvas" width="640" height="576"></canvas>
+    </div>
+    <div class="box">
+      <h3>Depth (Computed)</h3>
+      <canvas id="depthCanvas" width="640" height="576"></canvas>
+    </div>
+  </div>
+
+  <!-- Hidden video element to receive the incoming LiveKit video track -->
+  <video id="videoElement" playsinline muted style="display: none;"></video>
+
+  <!-- LiveKit JS SDK UMD build (v2) -->
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+  <script>
+    // ----- CONFIGURATION -----
+    // Replace these with your LiveKit server URL and a valid JWT token.
+    const LIVEKIT_URL = "wss://vlmns-7prfjvwk.livekit.cloud";
+    const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NDA2NTc5ODEsImlzcyI6IkFQSWpkMkdwb1pjeEt4TSIsIm5iZiI6MTc0MDQwNzk4MSwic3ViIjoiYnJvd3NlciIsInZpZGVvIjp7ImNhblB1Ymxpc2giOnRydWUsImNhblB1Ymxpc2hEYXRhIjp0cnVlLCJjYW5TdWJzY3JpYmUiOnRydWUsInJvb20iOiJteS1yb29tIiwicm9vbUpvaW4iOnRydWV9fQ.yzX_3ULQjHyMpCbNu5PKOVE_TE5kBdIL23Wj1A0dqr0";
+
+    // The incoming megaframe has dimensions 1280x1296.
+    const FRAME_WIDTH = 1280;
+    const FRAME_HEIGHT = 1296;
+    // According to your Python logic, the packed regions are extracted from the Y plane:
+    // - Lobits (LSB) region: rows 720 to 1008 (288 rows)
+    // - Hibits (MSB) region: rows 1008 to 1296 (288 rows)
+    const LOBITS_Y_START = 720;
+    const LOBITS_Y_END = 1008;
+    const HIBITS_Y_START = 1008;
+    const HIBITS_Y_END = 1296;
+
+    // The unpacking function (mimicking the Python code) assumes:
+    //   original_width = packed_width // 2   and   original_height = packed_height * 2.
+    // For a packed region of size (288, 1280), the output will be 640x576.
+    function unpackPackedDepth(packedData, packedWidth, packedHeight) {
+      const origWidth = Math.floor(packedWidth / 2);
+      const origHeight = packedHeight * 2;
+      const output = new Uint8ClampedArray(origWidth * origHeight);
+      // Top half: copy first origWidth columns from each row.
+      for (let row = 0; row < packedHeight; row++) {
+        for (let col = 0; col < origWidth; col++) {
+          output[row * origWidth + col] = packedData[row * packedWidth + col];
+        }
+      }
+      // Bottom half: copy next origWidth columns.
+      for (let row = 0; row < packedHeight; row++) {
+        for (let col = 0; col < origWidth; col++) {
+          output[(row + packedHeight) * origWidth + col] = packedData[row * packedWidth + col + origWidth];
+        }
+      }
+      return { data: output, width: origWidth, height: origHeight };
+    }
+
+    // ----- CANVAS SETUP -----
+    const lsbCanvas = document.getElementById("lsbCanvas");
+    const msbCanvas = document.getElementById("msbCanvas");
+    const depthCanvas = document.getElementById("depthCanvas");
+    const lsbCtx = lsbCanvas.getContext("2d");
+    const msbCtx = msbCanvas.getContext("2d");
+    const depthCtx = depthCanvas.getContext("2d");
+
+    // Create an offscreen canvas to capture the incoming full megaframe.
+    const offscreenCanvas = document.createElement("canvas");
+    offscreenCanvas.width = FRAME_WIDTH;
+    offscreenCanvas.height = FRAME_HEIGHT;
+    const offscreenCtx = offscreenCanvas.getContext("2d", { willReadFrequently: true });
+
+    // ----- FRAME PROCESSING -----
+    // Process each frame from the hidden video element.
+    function processFrame() {
+      console.log("Frame received at", new Date().toISOString());
+      offscreenCtx.drawImage(videoElement, 0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+
+      // Extract the packed regions.
+      const lobitsImgData = offscreenCtx.getImageData(0, LOBITS_Y_START, FRAME_WIDTH, LOBITS_Y_END - LOBITS_Y_START);
+      const hibitsImgData = offscreenCtx.getImageData(0, HIBITS_Y_START, FRAME_WIDTH, HIBITS_Y_END - HIBITS_Y_START);
+
+      // Helper to extract the red channel as a one-dimensional array.
+      function extractPackedData(imgData) {
+        const len = imgData.width * imgData.height;
+        const arr = new Uint8ClampedArray(len);
+        for (let i = 0; i < len; i++) {
+          arr[i] = imgData.data[i * 4]; // red channel (assuming grayscale)
+        }
+        return arr;
+      }
+      const lobitsPacked = extractPackedData(lobitsImgData);
+      const hibitsPacked = extractPackedData(hibitsImgData);
+
+      // Unpack the packed regions.
+      const lobitsUnpacked = unpackPackedDepth(lobitsPacked, lobitsImgData.width, lobitsImgData.height);
+      const hibitsUnpacked = unpackPackedDepth(hibitsPacked, hibitsImgData.width, hibitsImgData.height);
+
+      // Create ImageData objects for MSB and LSB.
+      const lsbImageData = new ImageData(lobitsUnpacked.width, lobitsUnpacked.height);
+      const msbImageData = new ImageData(hibitsUnpacked.width, hibitsUnpacked.height);
+      for (let i = 0; i < lobitsUnpacked.data.length; i++) {
+        const val = lobitsUnpacked.data[i];
+        lsbImageData.data[i * 4 + 0] = val;
+        lsbImageData.data[i * 4 + 1] = val;
+        lsbImageData.data[i * 4 + 2] = val;
+        lsbImageData.data[i * 4 + 3] = 255;
+      }
+      for (let i = 0; i < hibitsUnpacked.data.length; i++) {
+        const val = hibitsUnpacked.data[i];
+        msbImageData.data[i * 4 + 0] = val;
+        msbImageData.data[i * 4 + 1] = val;
+        msbImageData.data[i * 4 + 2] = val;
+        msbImageData.data[i * 4 + 3] = 255;
+      }
+      lsbCtx.putImageData(lsbImageData, 0, 0);
+      msbCtx.putImageData(msbImageData, 0, 0);
+
+      // Compute the depth image:
+      // For each pixel: depth16 = (MSB << 8) | LSB.
+      // Then convert to an 8-bit value for display (e.g., by shifting right 8 bits).
+      const depthWidth = msbImageData.width; // should be 640
+      const depthHeight = msbImageData.height; // should be 576
+      const depthImageData = new ImageData(depthWidth, depthHeight);
+      for (let i = 0; i < depthWidth * depthHeight; i++) {
+        const msbVal = hibitsUnpacked.data[i];
+        const lsbVal = lobitsUnpacked.data[i];
+        const depth16 = (msbVal << 8) | lsbVal;
+        const depth8 = depth16 >> 8;  // simple scaling for display
+        depthImageData.data[i * 4 + 0] = depth8;
+        depthImageData.data[i * 4 + 1] = depth8;
+        depthImageData.data[i * 4 + 2] = depth8;
+        depthImageData.data[i * 4 + 3] = 255;
+      }
+      depthCtx.putImageData(depthImageData, 0, 0);
+
+      // Request next frame.
+      videoElement.requestVideoFrameCallback(processFrame);
+    }
+
+    // ----- LIVEKIT CONNECTION & AUTO-SUBSCRIPTION -----
+    // The incoming video track is attached to a hidden video element.
+    const videoElement = document.getElementById("videoElement");
+
+    async function connectLiveKit() {
+      const room = new LivekitClient.Room({ autoSubscribe: true });
+      await room.connect(LIVEKIT_URL, TOKEN);
+      console.log("Connected to room:", room.name);
+      
+      room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+        if (track.kind === LivekitClient.Track.Kind.Video) {
+          console.log("Video track subscribed:", publication.sid);
+          const attachedEl = track.attach();
+          attachedEl.style.display = "none";
+          videoElement.srcObject = attachedEl.srcObject;
+          videoElement.play();
+          videoElement.addEventListener("loadeddata", () => {
+            videoElement.requestVideoFrameCallback(processFrame);
+          });
+        }
+      });
+    }
+    
+    connectLiveKit().catch(err => console.error("LiveKit connection error:", err));
+  </script>
+</body>
+</html>

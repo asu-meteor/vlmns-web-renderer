@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>LiveKit Video Receiver</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    video {
+      width: 100%;
+      max-width: 640px;
+      background: #000;
+    }
+  </style>
+</head>
+<body>
+  <h1>LiveKit Video Receiver</h1>
+  <!-- Visible video element for live video playback -->
+  <video id="videoElement" autoplay playsinline controls></video>
+
+  <!-- LiveKit JS SDK UMD build -->
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+  <script>
+    // Replace these with your LiveKit server URL and valid JWT token.
+    const LIVEKIT_URL = "wss://vlmns-7prfjvwk.livekit.cloud";
+    const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NDA2NTc5ODEsImlzcyI6IkFQSWpkMkdwb1pjeEt4TSIsIm5iZiI6MTc0MDQwNzk4MSwic3ViIjoiYnJvd3NlciIsInZpZGVvIjp7ImNhblB1Ymxpc2giOnRydWUsImNhblB1Ymxpc2hEYXRhIjp0cnVlLCJjYW5TdWJzY3JpYmUiOnRydWUsInJvb20iOiJteS1yb29tIiwicm9vbUpvaW4iOnRydWV9fQ.yzX_3ULQjHyMpCbNu5PKOVE_TE5kBdIL23Wj1A0dqr0";
+
+    async function connectLiveKit() {
+      // Create a new room instance with autoSubscribe enabled (true by default)
+      const room = new LivekitClient.Room({ autoSubscribe: true });
+      await room.connect(LIVEKIT_URL, TOKEN);
+      console.log("Connected to room:", room.name);
+
+      // Listen for video track subscriptions.
+      room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+        if (track.kind === LivekitClient.Track.Kind.Video) {
+          console.log("Subscribed video track:", publication.sid);
+          const videoElement = document.getElementById("videoElement");
+          const attachedEl = track.attach();
+          // Set the stream from the attached element to our visible video element.
+          videoElement.srcObject = attachedEl.srcObject;
+          videoElement.play();
+        }
+      });
+    }
+
+    connectLiveKit().catch(err => console.error("LiveKit connection error:", err));
+  </script>
+</body>
+</html>
